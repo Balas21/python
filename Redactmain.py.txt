@@ -1,0 +1,148 @@
+import fitz  # PyMuPDF
+from PIL import Image, ImageDraw
+import pytesseract
+import io
+import spacy  # Load spaCy model
+import os  # To handle saving files
+from spacy.matcher import Matcher
+from spacy.tokens import Span
+from spacy.pipeline import EntityRuler
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # Update this path as needed
+
+# Load spaCy model
+nlp = spacy.load("en_core_web_trf")
+
+def redact_pii_text(page):
+   
+    text_blocks = page.get_text("dict")["blocks"]
+    
+    for block in text_blocks:
+        if "lines" in block:
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    text = span["text"]
+                    bbox = fitz.Rect(span["bbox"])
+                    
+                    # Detect PII using spaCy
+                    doc = nlp(text)                    
+                    for ent in doc.ents:
+                        if ent.label_ in ["PERSON", "EMAIL", "PHONE", "GPE","UK_POSTCODE","APP_NUMBER"]:
+                           for rect in page.search_for(ent.text): 
+                            page.add_redact_annot(rect,fill=(0, 0, 0))  # mark as "remove this" 
+
+    page.apply_redactions()   
+  
+
+
+def redact_pii_image(image, page_number, img_index, output_folder):
+    # OCR to extract text and bounding box data
+    ocr_result = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    ocr_text = " ".join(ocr_result['text'])
+    print(f"OCR Text from image: {ocr_text}")
+    
+    # Use SpaCy to identify entities
+    doc = nlp(ocr_text)
+    
+    # Prepare to draw on the image
+    draw = ImageDraw.Draw(image)
+    
+    # Process each entity detected by SpaCy
+    for ent in doc.ents:
+        print(f"Document entity: {ent.text}, Label: {ent.label_}")
+        
+        # Only redact specific types of entities
+        if ent.label_ in ["PERSON", "EMAIL", "DATE", "ORG", "GPE"]:
+            # Normalize entity text for matching
+            entity_text = ent.text.lower().strip()
+            matched_boxes = []
+
+            # Sliding window to find multi-word matches in OCR output
+            for i in range(len(ocr_result['text'])):
+                ocr_phrase = ""
+                box_coords = []
+                
+                for j in range(i, len(ocr_result['text'])):
+                    word = ocr_result['text'][j].strip()
+                    if word == "":
+                        continue
+                    
+                    # Build the OCR phrase incrementally
+                    ocr_phrase += ("" if ocr_phrase == "" else " ") + word.lower()
+                    box_coords.append(j)
+
+                    # Break if the phrase matches the entity text
+                    if ocr_phrase == entity_text:
+                        matched_boxes = box_coords
+                        break
+                
+                if matched_boxes:
+                    break
+            
+            # If a match is found, compute the bounding box and redact
+            if matched_boxes:
+                x_min = min(ocr_result['left'][idx] for idx in matched_boxes)
+                y_min = min(ocr_result['top'][idx] for idx in matched_boxes)
+                x_max = max(ocr_result['left'][idx] + ocr_result['width'][idx] for idx in matched_boxes)
+                y_max = max(ocr_result['top'][idx] + ocr_result['height'][idx] for idx in matched_boxes)
+                
+                # Draw a black rectangle over the detected entity
+                draw.rectangle([x_min, y_min, x_max, y_max], fill="black")
+                print(f"Redacted entity: {ent.text}, Bounding box: [{x_min}, {y_min}, {x_max}, {y_max}]")
+
+    # Save the redacted image
+    redacted_image_path = f"{output_folder}/redacted_page_{page_number}_img_{img_index}.png"
+    image.save(redacted_image_path)
+    print(f"Saved redacted image: {redacted_image_path}")
+    
+    # Save the redacted image separately in the specified output folder
+    redacted_image_path = os.path.join(output_folder, f"redacted_page_{page_number}_image_{img_index}.png")
+    image.save(redacted_image_path)
+    return redacted_image_path
+
+def process_images(page, output_folder, page_number):
+    images = page.get_images(full=True)    
+    for img_index, img in enumerate(images):
+        xref = img[0]  # Reference to the image (image xref)
+        base_image = page.parent.extract_image(xref)
+        image_bytes = base_image["image"]
+        image_ext = base_image["ext"]
+        
+        # Open the image using Pillow
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Redact PII in the image
+        redacted_image_path = redact_pii_image(image, page_number, img_index, output_folder)
+        
+        # Save the redacted image to bytes
+        img_stream = io.BytesIO()
+        redacted_image = Image.open(redacted_image_path)
+        redacted_image.save(img_stream, format=image_ext.upper())  
+        img_stream.seek(0)        
+        page.replace_image(xref,filename=None, pixmap=None, stream=img_stream)  
+
+
+def process_and_redact_pii(input_pdf, output_pdf, output_folder):
+   #Open the pdf using fitz--
+    doc = fitz.open(input_pdf)
+    print(f"No of pages in the PDF is {len(doc)}")
+    
+    for page_num in range(len(doc)):
+        print(f"Processing PII Redact for the Page Number : {page_num}")
+        page = doc[page_num]      
+      
+        redact_pii_text(page)     
+     
+        process_images(page, output_folder, page_num)
+     
+    # Save the redacted PDF
+    doc.save(output_pdf)
+
+# Run the process
+input_pdf = "report1.pdf"
+output_pdf = "output-7.pdf"
+output_folder = "output_images1"  # Folder to store the redacted images
+
+# Create output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
+
+process_and_redact_pii(input_pdf, output_pdf, output_folder)
